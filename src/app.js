@@ -26,7 +26,16 @@ const FATAL_CODES = new Set([
   'auth/project-not-found', 'auth/invalid-app-id',
 ]);
 const PHASE_LABEL = { setup: '設定中', report: '報告時間', question: '提問時間', rating: '評分／換場時間', done: '已完成' };
-const DURATION = { report: 300, question: 180, rating: 180 };
+const DURATION = { rating: 180 }; // 評分／換場固定 3 分鐘
+// 報告、提問時間可由老師調整（整數分鐘）
+const MINUTES_RANGE = { report: { min: 3, max: 10, def: 5 }, question: { min: 1, max: 5, def: 3 } };
+const normalizeMinutes = (kind, v) => {
+  const r = MINUTES_RANGE[kind];
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) ? clamp(n, r.min, r.max) : r.def;
+};
+const normalizeDurations = (d = {}) => ({ reportMinutes: normalizeMinutes('report', d.reportMinutes), questionMinutes: normalizeMinutes('question', d.questionMinutes) });
+const phaseSeconds = (phase) => (phase === 'report' ? state.durations.reportMinutes * 60 : phase === 'question' ? state.durations.questionMinutes * 60 : DURATION.rating);
 const REPORT_CRITERIA = [
   { key: 'inquiryDesign', short: '問題與方法', label: '探究問題與方法設計', description: '問題意識、變因控制、方法合理性', avgId: 'reportInquiryAvg' },
   { key: 'evidenceAnalysis', short: '證據與分析', label: '資料證據與分析解釋', description: '數據品質、圖表呈現、證據支持結論', avgId: 'reportEvidenceAvg' },
@@ -279,6 +288,7 @@ function defaultState() {
     currentIndex: 0,
     phase: 'setup',
     timer: { running: false, phase: 'setup', duration: 0, startedAt: null, endsAt: null },
+    durations: normalizeDurations(),
     scores: {},
     updatedAt: new Date().toISOString(),
   };
@@ -310,6 +320,7 @@ function normalizeLoadedState(parsed, base = defaultState()) {
     questionOrder,
     currentIndex: clamp(Number(parsed.currentIndex || 0), 0, Math.max(0, groups.length - 1)),
     timer: parsed.timer || base.timer,
+    durations: normalizeDurations(parsed.durations),
     scores: normalizeScoresTree(parsed.scores),
   };
 }
@@ -478,6 +489,7 @@ function publicState() {
       startedAt: Number.isFinite(Number(t.startedAt)) && t.startedAt !== null ? Number(t.startedAt) : null,
       endsAt: Number.isFinite(Number(t.endsAt)) && t.endsAt !== null ? Number(t.endsAt) : null,
     },
+    durations: normalizeDurations(state.durations),
     updatedAt: new Date().toISOString(),
   };
 }
@@ -616,12 +628,22 @@ function setupTeacher() {
     const text = $('studentUrl').textContent;
     try { await navigator.clipboard.writeText(text); alert('已複製學生網址'); } catch (_) { prompt('請複製學生網址', text); }
   };
-  $('startReportBtn').onclick = () => startPhase('report', DURATION.report);
-  $('startQuestionBtn').onclick = () => startPhase('question', DURATION.question);
-  $('startRatingBtn').onclick = () => startPhase('rating', DURATION.rating);
+  // 報告／提問時間設定：只影響「下一次開始」的計時，不會改動正在倒數的時間
+  fillMinuteSelect('reportMinutesSelect', 'report');
+  fillMinuteSelect('questionMinutesSelect', 'question');
+  const onMinutesChange = () => {
+    state.durations = normalizeDurations({ reportMinutes: $('reportMinutesSelect').value, questionMinutes: $('questionMinutesSelect').value });
+    saveState();
+    renderTeacher(false);
+  };
+  $('reportMinutesSelect').onchange = onMinutesChange;
+  $('questionMinutesSelect').onchange = onMinutesChange;
+  $('startReportBtn').onclick = () => startPhase('report', phaseSeconds('report'));
+  $('startQuestionBtn').onclick = () => startPhase('question', phaseSeconds('question'));
+  $('startRatingBtn').onclick = () => startPhase('rating', phaseSeconds('rating'));
   $('nextRoundBtn').onclick = () => {
     const cr = currentRound();
-    if (cr.total && cr.index < cr.total - 1) { state.currentIndex = cr.index + 1; startPhase('report', DURATION.report); }
+    if (cr.total && cr.index < cr.total - 1) { state.currentIndex = cr.index + 1; startPhase('report', phaseSeconds('report')); }
     else { state.phase = 'done'; state.timer = { running: false, phase: 'done', duration: 0, startedAt: null, endsAt: null }; saveState(); renderTeacher(); alert('已到最後一輪。'); }
   };
   $('exportXlsxBtn').onclick = exportXlsx;
@@ -766,7 +788,24 @@ async function updateStudentUrl(sessionId) {
   }
 }
 
+function fillMinuteSelect(id, kind) {
+  const r = MINUTES_RANGE[kind];
+  const opts = [];
+  for (let m = r.min; m <= r.max; m++) opts.push(`<option value="${m}">${m} 分鐘${m === r.def ? '（預設）' : ''}</option>`);
+  $(id).innerHTML = opts.join('');
+}
+
+function renderDurationControls() {
+  const d = state.durations;
+  if (document.activeElement !== $('reportMinutesSelect')) $('reportMinutesSelect').value = String(d.reportMinutes);
+  if (document.activeElement !== $('questionMinutesSelect')) $('questionMinutesSelect').value = String(d.questionMinutes);
+  $('startReportBtn').textContent = `開始報告 ${mmss(d.reportMinutes * 60).replace(/^0/, '')}`;
+  $('startQuestionBtn').textContent = `開始提問 ${mmss(d.questionMinutes * 60).replace(/^0/, '')}`;
+  $('nextRoundBtn').textContent = `下一輪＋開始報告 ${mmss(d.reportMinutes * 60).replace(/^0/, '')}`;
+}
+
 function renderTeacher(updateInputs = true) {
+  renderDurationControls();
   if (updateInputs && document.activeElement !== $('titleInput')) $('titleInput').value = state.title;
   if (updateInputs && document.activeElement !== $('groupsInput')) $('groupsInput').value = state.groups.join('\n');
   updateGroupCountHint();
