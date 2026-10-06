@@ -1,4 +1,4 @@
-// 探究與實作期末報告平台 — Firebase Realtime Database 版
+// 探究與實作上台報告平台 — Firebase Realtime Database 版
 // 學生頁只載入 Firebase（app / database / auth）；QR 與 Excel 套件只在老師端需要時才載入。
 import { firebaseConfig, firebaseEmulator } from './firebase-config.js';
 
@@ -281,7 +281,7 @@ function defaultState() {
   const [reportOrder, questionOrder] = makeDerangedOrders(groups);
   return {
     schemaVersion: 3,
-    title: '探究與實作期末報告',
+    title: '探究與實作上台報告',
     groups,
     reportOrder,
     questionOrder,
@@ -474,7 +474,7 @@ function publicState() {
   const groupSet = {};
   for (const g of state.groups) groupSet[g] = true;
   return {
-    title: state.title || '探究與實作期末報告',
+    title: state.title || '探究與實作上台報告',
     groups: state.groups,
     groupSet,
     reportOrder: state.reportOrder,
@@ -599,7 +599,7 @@ function setupTeacher() {
     if (groups.length < 2) return alert('至少需要 2 個組別。');
     if (hasAnyScores(state.scores) && !confirm('重新抽籤會清空目前所有評分資料（建議先下載 Excel／JSON）。確定繼續？')) return;
     const [reportOrder, questionOrder] = makeDerangedOrders(groups);
-    state = { ...state, schemaVersion: 3, title: safeText($('titleInput').value) || '探究與實作期末報告', groups, reportOrder, questionOrder, currentIndex: 0, scores: {}, phase: 'setup', timer: { running: false, phase: 'setup', duration: 0, startedAt: null, endsAt: null } };
+    state = { ...state, schemaVersion: 3, title: safeText($('titleInput').value) || '探究與實作上台報告', groups, reportOrder, questionOrder, currentIndex: 0, scores: {}, phase: 'setup', timer: { running: false, phase: 'setup', duration: 0, startedAt: null, endsAt: null } };
     saveState(); clearRemoteScores(); renderTeacher();
   };
   $('reshuffleBtn').onclick = () => {
@@ -881,7 +881,7 @@ function exportRows() {
 }
 
 async function exportXlsx() {
-  const filename = `${state.title || '探究與實作期末報告'}_評分資料_${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.xlsx`;
+  const filename = `${state.title || '探究與實作上台報告'}_評分資料_${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.xlsx`;
   try {
     await loadScript(XLSX_URL);
   } catch (_) {
@@ -902,7 +902,7 @@ function exportJson() {
   const blob = new Blob([JSON.stringify({ ...state, sessionId: teacher.sessionId || localStorage.getItem(SESSION_KEY) || null }, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `${state.title || '探究與實作期末報告'}_備份.json`;
+  a.download = `${state.title || '探究與實作上台報告'}_備份.json`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -1091,7 +1091,7 @@ function renderStudentTimer() {
 function renderStudent() {
   const s = student.state;
   if (!s) return;
-  $('studentTitle').textContent = s.title || '探究與實作期末報告';
+  $('studentTitle').textContent = s.title || '探究與實作上台報告';
   const cr = currentRound(s);
   $('studentReportGroup').textContent = cr.reportGroup || '—';
   $('studentQuestionGroup').textContent = cr.questionGroup || '—';
