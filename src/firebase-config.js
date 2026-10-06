@@ -15,13 +15,13 @@
 // =====================================================================
 
 export const firebaseConfig = {
-  apiKey: 'YOUR_API_KEY',
-  authDomain: 'YOUR_PROJECT_ID.firebaseapp.com',
-  databaseURL: 'https://YOUR_PROJECT_ID-default-rtdb.asia-southeast1.firebasedatabase.app',
-  projectId: 'YOUR_PROJECT_ID',
-  storageBucket: 'YOUR_PROJECT_ID.firebasestorage.app',
-  messagingSenderId: 'YOUR_SENDER_ID',
-  appId: 'YOUR_APP_ID',
+  apiKey: 'AIzaSyAEaUyp74rGLyGSNX3c7HaBHoYoZk70qFE',
+  authDomain: 'inquiry-report-platform.firebaseapp.com',
+  databaseURL: 'https://inquiry-report-platform-default-rtdb.asia-southeast1.firebasedatabase.app',
+  projectId: 'inquiry-report-platform',
+  storageBucket: 'inquiry-report-platform.firebasestorage.app',
+  messagingSenderId: '434922076327',
+  appId: '1:434922076327:web:c0662c57d68d2c99c24382',
 };
 
 // 開發測試用（一般老師不用改）：連到本機 Firebase Emulator。
