@@ -125,6 +125,11 @@ Excel 會包含：
 - 在線學生數：學生手機寫入 `presence/{uid}`，斷線時由 Firebase 自動移除。
 - 老師開新 Session 時，會在舊 Session 標記 `movedTo`，仍停在舊 QR 的學生手機會自動跳到新 Session。
 - 學生頁只載入 Firebase 程式庫；QR Code（qrious）與 Excel（SheetJS）只在老師端需要時才載入。
+- 連線容錯（針對 4G／5G 不穩）：
+  - `index.html` 以 `modulepreload` 預先下載 Firebase SDK；SDK 下載失敗時自動重新載入頁面（2 分鐘內最多 2 次）。
+  - 匿名登入失敗會自動重試（1、2、4…最多 15 秒間隔），慢的請求會持續等待，不會因逾時直接卡死。
+  - 資料庫預設走 WebSocket；若 7 秒內沒連上（例如 WebSocket 被卡住），自動改用 long polling，不必等 SDK 內建的 30 秒逾時。
+  - 學生狀態列會顯示目前進度與已等待秒數；超過 45 秒仍未連上才提示可手動重新整理。
 
 ## 本機 LAN 備援版
 

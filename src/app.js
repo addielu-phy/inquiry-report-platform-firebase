@@ -2,7 +2,7 @@
 // 學生頁只載入 Firebase（app / database / auth）；QR 與 Excel 套件只在老師端需要時才載入。
 import { firebaseConfig, firebaseEmulator } from './firebase-config.js';
 
-const FIREBASE_SDK_VERSION = '12.19.0';
+const FIREBASE_SDK_VERSION = '12.19.0'; // 修改版本時，index.html 的 modulepreload 網址也要一起改
 const SDK_URL = (name) => `https://www.gstatic.com/firebasejs/${FIREBASE_SDK_VERSION}/firebase-${name}.js`;
 const QRIOUS_URL = 'https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js';
 const XLSX_URL = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
@@ -12,7 +12,19 @@ const STUDENT_ID_KEY = 'inquiryPracticeReportPlatform.studentIdentity.v1';
 const SESSION_KEY = 'inquiryPracticeReportPlatform.firebaseSessionId.v1';
 const DEFAULT_GROUP_COUNT = 9;
 const SUBMIT_TIMEOUT_MS = 8000;
-const NET_TIMEOUT_MS = 15000;
+const NET_TIMEOUT_MS = 25000; // 老師端單次讀寫的等待上限
+const SDK_IMPORT_WAIT_MS = 20000; // 下載 SDK 每等這麼久更新一次提示（不放棄）
+const SDK_IMPORT_MAX_WAITS = 4;
+const AUTH_ATTEMPT_WAIT_MS = 35000; // Firebase Auth 自己約 30 秒（手機 60 秒）會回報網路錯誤
+const AUTH_STATE_WAIT_MS = 10000;
+const WS_WATCHDOG_MS = 7000; // 這麼久還沒連上資料庫 → 改用 long polling
+const SLOW_HINT_MS = 45000; // 超過這個時間仍未連上，才提示可手動重新整理
+const AUTO_RELOAD_KEY = 'inquiryPracticeReportPlatform.autoReload.v1';
+const FATAL_CODES = new Set([
+  'not-configured', 'auth/operation-not-allowed', 'auth/admin-restricted-operation', 'auth/configuration-not-found',
+  'auth/api-key-not-valid', 'auth/invalid-api-key', 'auth/unauthorized-domain', 'auth/app-not-authorized',
+  'auth/project-not-found', 'auth/invalid-app-id',
+]);
 const PHASE_LABEL = { setup: '設定中', report: '報告時間', question: '提問時間', rating: '評分／換場時間', done: '已完成' };
 const DURATION = { report: 300, question: 180, rating: 180 };
 const REPORT_CRITERIA = [
@@ -31,6 +43,16 @@ const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const safeText = (v) => String(v ?? '').replace(/\s+/g, ' ').trim();
 const safeGroupName = (v) => safeText(v).replace(FORBIDDEN_KEY_CHARS, (ch) => FULLWIDTH[ch]).slice(0, 40);
 const makeDefaultGroups = (count) => Array.from({ length: count }, (_, i) => `第${i + 1}組`);
+
+// 盡早對資料庫主機做 DNS／TLS 預先連線（網址來自 firebase-config.js）
+try {
+  if (firebaseConfig?.databaseURL && !/YOUR_/.test(firebaseConfig.databaseURL)) {
+    const link = document.createElement('link');
+    link.rel = 'preconnect';
+    link.href = new URL(firebaseConfig.databaseURL).origin;
+    document.head.appendChild(link);
+  }
+} catch (_) { /* ignore */ }
 
 let serverOffset = 0; // Firebase 伺服器時間 - 本機時間（毫秒），讓老師與學生手機的倒數一致
 const serverNow = () => Date.now() + serverOffset;
@@ -86,7 +108,8 @@ function fbErrorText(err) {
   if (code === 'auth/configuration-not-found') return 'Firebase 專案尚未啟用 Authentication（請開啟匿名登入）。';
   if (code === 'auth/api-key-not-valid' || code === 'auth/invalid-api-key' || /api-key-not-valid/.test(msg)) return 'Firebase apiKey 錯誤：請檢查 src/firebase-config.js。';
   if (code === 'auth/unauthorized-domain') return '這個網域未被 Firebase 授權：請到 Authentication → 設定 → 授權網域 加入。';
-  if (code === 'auth/network-request-failed') return '網路連線失敗，請確認手機有網路後重新整理。';
+  if (code === 'auth/network-request-failed') return '網路連線失敗（會自動重試）。';
+  if (code === 'auth/too-many-requests') return '登入請求太頻繁，稍後會自動重試。';
   if (/Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module/i.test(msg)) return '無法下載 Firebase 程式庫（gstatic.com），請確認網路。';
   return msg || '未知錯誤';
 }
@@ -110,6 +133,42 @@ function isConfigured(cfg) {
   return Boolean(cfg && cfg.apiKey && cfg.databaseURL && !/YOUR_/.test(JSON.stringify(cfg)));
 }
 
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+const isFatalFirebaseError = (e) => FATAL_CODES.has(String(e?.code || '')) || /api-key-not-valid/.test(String(e?.message || ''));
+
+// 連線進度回報（學生端顯示在狀態列，老師端顯示在 Session 狀態）
+let onFirebaseProgress = () => {};
+const reportProgress = (text) => { try { onFirebaseProgress(text); } catch (_) { /* ignore */ } };
+
+// 瀏覽器會把「下載失敗的 ES module」記住，同一頁面重試 import 不會重新下載；
+// 因此下載失敗時自動重新載入頁面（2 分鐘內最多 2 次），避免學生要自己按重新整理。
+function tryAutoReload() {
+  let rec = { count: 0, first: Date.now() };
+  try { rec = JSON.parse(sessionStorage.getItem(AUTO_RELOAD_KEY) || 'null') || rec; } catch (_) { /* ignore */ }
+  if (Date.now() - rec.first > 120000) rec = { count: 0, first: Date.now() };
+  if (rec.count >= 2) return false;
+  rec.count += 1;
+  try { sessionStorage.setItem(AUTO_RELOAD_KEY, JSON.stringify(rec)); } catch (_) { return false; }
+  setTimeout(() => location.reload(), 600);
+  return true;
+}
+
+async function importFirebaseSdk() {
+  // 與 index.html 的 <link rel="modulepreload"> 是同一組網址，會直接使用已預先下載的檔案
+  const pending = Promise.all([import(SDK_URL('app')), import(SDK_URL('database')), import(SDK_URL('auth'))]);
+  for (let wait = 1; ; wait++) {
+    try {
+      return await withTimeout(pending, SDK_IMPORT_WAIT_MS, 'sdk-timeout');
+    } catch (e) {
+      if (e.code === 'timeout' && wait < SDK_IMPORT_MAX_WAITS) { reportProgress(`下載程式庫較慢，仍在等待…（已等 ${Math.round((wait * SDK_IMPORT_WAIT_MS) / 1000)} 秒）`); continue; }
+      if (tryAutoReload()) { reportProgress('程式庫下載失敗，自動重新載入頁面…'); await new Promise(() => {}); }
+      const err = new Error('無法下載 Firebase 程式庫（www.gstatic.com），請確認網路後重新整理。');
+      err.code = 'sdk-load-failed';
+      throw err;
+    }
+  }
+}
+
 let fbCorePromise = null;
 let fbCore = null;
 async function getFirebaseCore() {
@@ -118,7 +177,7 @@ async function getFirebaseCore() {
     fbCorePromise = (async () => {
       const emu = emulatorSettings();
       let cfg = firebaseConfig;
-      if (emu && !isConfigured(cfg)) {
+      if (emu) { // Emulator 一律用 demo 專案，避免誤連正式資料庫
         cfg = { apiKey: 'demo-api-key', authDomain: 'demo-ipr.firebaseapp.com', projectId: 'demo-ipr', databaseURL: `http://${emu.host}:${emu.databasePort}?ns=demo-ipr-default-rtdb` };
       }
       if (!isConfigured(cfg)) {
@@ -126,10 +185,8 @@ async function getFirebaseCore() {
         e.code = 'not-configured';
         throw e;
       }
-      const [appMod, dbMod, authMod] = await withTimeout(
-        Promise.all([import(SDK_URL('app')), import(SDK_URL('database')), import(SDK_URL('auth'))]),
-        NET_TIMEOUT_MS, '下載 Firebase 程式庫逾時，請確認網路。',
-      );
+      reportProgress('下載程式庫中…');
+      const [appMod, dbMod, authMod] = await importFirebaseSdk();
       const app = appMod.getApps().length ? appMod.getApp() : appMod.initializeApp(cfg);
       const db = dbMod.getDatabase(app);
       const auth = authMod.getAuth(app);
@@ -137,8 +194,14 @@ async function getFirebaseCore() {
         dbMod.connectDatabaseEmulator(db, emu.host, emu.databasePort);
         authMod.connectAuthEmulator(auth, `http://${emu.host}:${emu.authPort}`, { disableWarnings: true });
       }
+      fbCore = { app, db, auth, authMod, ...dbMod, uid: null, connected: false, everConnected: false, longPolling: false, signInPromise: null };
+      // 立刻開始連資料庫（與匿名登入同時進行，不互相等待）
       dbMod.onValue(dbMod.ref(db, '.info/serverTimeOffset'), (snap) => { serverOffset = Number(snap.val()) || 0; });
-      fbCore = { app, db, auth, authMod, ...dbMod, uid: null };
+      dbMod.onValue(dbMod.ref(db, '.info/connected'), (snap) => {
+        fbCore.connected = snap.val() === true;
+        if (fbCore.connected) fbCore.everConnected = true;
+      });
+      startConnectionWatchdog(fbCore);
       return fbCore;
     })();
     fbCorePromise.catch(() => { fbCorePromise = null; });
@@ -146,17 +209,58 @@ async function getFirebaseCore() {
   return fbCorePromise;
 }
 
+// Realtime Database SDK 預設只用 WebSocket，若 WebSocket 卡住（不回應也不斷線），
+// SDK 要等 30 秒才會放棄並改用 long polling。這裡 7 秒沒連上就主動切換。
+function startConnectionWatchdog(core) {
+  const timer = setInterval(() => {
+    if (core.everConnected || core.longPolling) { clearInterval(timer); return; }
+    if (!navigator.onLine) return;
+    core.longPolling = true;
+    clearInterval(timer);
+    console.warn(`Realtime Database ${WS_WATCHDOG_MS / 1000} 秒內未連上，改用 long polling`);
+    reportProgress('改用相容模式連線中…');
+    try {
+      core.goOffline(core.db);
+      core.forceLongPolling();
+      core.goOnline(core.db);
+    } catch (e) { console.warn(e); }
+  }, WS_WATCHDOG_MS);
+}
+
+// 匿名登入：自動重試（指數退避），只有設定錯誤才會放棄
+async function signInWithRetry(core) {
+  reportProgress('登入中…');
+  try { await withTimeout(core.auth.authStateReady(), AUTH_STATE_WAIT_MS, 'auth-state'); } catch (_) { /* 繼續嘗試登入 */ }
+  let attempt = 0;
+  let delay = 1000;
+  let pending = null;
+  while (!core.auth.currentUser) {
+    attempt += 1;
+    if (attempt > 1) reportProgress(`登入中…（第 ${attempt} 次嘗試）`);
+    // 上一次請求還沒結束就繼續等它，不重複送出（避免產生多個匿名帳號）
+    if (!pending) pending = core.authMod.signInAnonymously(core.auth).finally(() => { pending = null; });
+    try {
+      await withTimeout(pending, AUTH_ATTEMPT_WAIT_MS, 'auth-timeout');
+    } catch (e) {
+      if (core.auth.currentUser) break;
+      if (isFatalFirebaseError(e)) throw e;
+      if (e.code === 'timeout') { reportProgress('登入較慢，仍在等待回應…'); continue; }
+      console.warn('signInAnonymously 失敗，稍後重試', e);
+      reportProgress(`登入暫時失敗（網路不穩），${Math.round(delay / 1000)} 秒後自動重試…（第 ${attempt} 次）`);
+      await sleep(delay);
+      delay = Math.min(delay * 2, 15000);
+    }
+  }
+  core.uid = core.auth.currentUser.uid;
+  return core;
+}
+
 // 取得 Firebase 並以匿名身分登入（同一瀏覽器重新整理後 uid 不變）
 async function initFirebase() {
   const core = await getFirebaseCore();
-  if (!core.uid) {
-    await withTimeout(core.auth.authStateReady(), NET_TIMEOUT_MS, '登入 Firebase 逾時，請確認網路。');
-    if (!core.auth.currentUser) {
-      await withTimeout(core.authMod.signInAnonymously(core.auth), NET_TIMEOUT_MS, '登入 Firebase 逾時，請確認網路。');
-    }
-    core.uid = core.auth.currentUser.uid;
-  }
-  return core;
+  if (core.uid) return core;
+  if (!core.signInPromise) core.signInPromise = signInWithRetry(core).finally(() => { core.signInPromise = null; });
+  return core.signInPromise;
 }
 
 const dbRef = (core, path) => core.ref(core.db, path);
@@ -526,6 +630,7 @@ function setupTeacher() {
   renderTeacher();
   setInterval(() => { renderTeacher(false); }, 1000);
 
+  onFirebaseProgress = (text) => { if (teacher.busy) setTeacherStatus(text, 'warn'); };
   // 重新整理後自動恢復上次的 Session（同一個 QR）
   const saved = localStorage.getItem(SESSION_KEY);
   if (!isConfigured(firebaseConfig) && !emulatorSettings()) setTeacherStatus('尚未設定 Firebase（見 README）', 'bad');
@@ -792,6 +897,9 @@ const student = {
   groupsKey: '',
   roundKey: '',
   connected: false,
+  everConnected: false,
+  stage: '連線中…',
+  startedAt: Date.now(),
   error: '',
   submitting: false,
   attempt: 0,
@@ -812,10 +920,15 @@ function renderStudentConn() {
   let text; let kind;
   if (student.error) { text = student.error; kind = 'bad'; }
   else if (!navigator.onLine) { text = '📴 手機目前離線，恢復網路後會自動重連'; kind = 'bad'; }
-  else if (!student.core) { text = '連線中…'; kind = 'muted'; }
   else if (student.connected && student.state) { text = '🟢 已連線'; kind = 'ok'; }
   else if (student.connected) { text = '已連線，讀取老師端資料中…'; kind = 'warn'; }
-  else { text = '🟡 連線中／重新連線中…'; kind = 'warn'; }
+  else if (student.everConnected) { text = '🟡 重新連線中…（會自動恢復）'; kind = 'warn'; }
+  else {
+    const sec = Math.round((Date.now() - student.startedAt) / 1000);
+    text = `${student.stage}${sec >= 3 ? `（${sec} 秒）` : ''}`;
+    if (Date.now() - student.startedAt > SLOW_HINT_MS) text += '　網路較慢，仍在自動重試；若超過 1–2 分鐘，可重新整理頁面。';
+    kind = sec >= 3 ? 'warn' : 'muted';
+  }
   el.textContent = text;
   el.className = `pill ${kind}`;
 }
@@ -851,23 +964,36 @@ async function setupStudent() {
     return;
   }
   student.sessionId = sessionId;
+  student.startedAt = Date.now();
+  onFirebaseProgress = (text) => { student.stage = text; renderStudentConn(); };
+  setInterval(renderStudentConn, 1000);
   renderStudentConn();
+  connectStudent();
+}
 
+async function connectStudent() {
+  const sessionId = student.sessionId;
   let core;
   try {
-    core = await initFirebase();
+    core = await initFirebase(); // 內部會自動重試，只有設定錯誤或程式庫無法下載才會失敗
   } catch (e) {
     console.error(e);
-    student.error = `連線失敗：${fbErrorText(e)}（請重新整理）`;
+    student.error = `連線失敗：${fbErrorText(e)}`;
     renderStudentConn();
     return;
   }
   student.core = core;
+  student.stage = '連線資料庫中…';
+  student.connected = core.connected;
   renderStudentConn();
+
+  // 登入完成立刻讀取老師端狀態（不等 .info/connected，也不等 presence）
+  listenStudentState(core, sessionId);
 
   const presenceRef = dbRef(core, `sessions/${sessionId}/presence/${core.uid}`);
   core.onValue(dbRef(core, '.info/connected'), (snap) => {
     student.connected = snap.val() === true;
+    if (student.connected) student.everConnected = true;
     renderStudentConn();
     if (student.connected) {
       core.onDisconnect(presenceRef).remove()
@@ -875,7 +1001,9 @@ async function setupStudent() {
         .catch((e) => console.warn('presence', e));
     }
   });
+}
 
+function listenStudentState(core, sessionId) {
   core.onValue(dbRef(core, `sessions/${sessionId}/state`), (snap) => {
     if (!snap.exists()) {
       student.state = null;
@@ -900,8 +1028,16 @@ async function setupStudent() {
     renderStudent();
     renderStudentConn();
   }, (err) => {
-    student.error = `讀取失敗：${fbErrorText(err)}`;
+    console.error(err);
+    if (/PERMISSION_DENIED|permission/i.test(String(err?.code) + String(err?.message))) {
+      student.error = `讀取失敗：${fbErrorText(err)}`;
+      renderStudentConn();
+      return;
+    }
+    // 其他暫時性錯誤：3 秒後自動重新監聽
+    student.stage = '讀取失敗，自動重試中…';
     renderStudentConn();
+    setTimeout(() => listenStudentState(core, sessionId), 3000);
   });
 }
 
