@@ -159,3 +159,11 @@ tr.conflict td { background: rgba(251,113,133,.14); }
   .hero > div:first-child { padding: 18px; }
   .hero h1 { font-size: 34px; }
 }
+
+/* Firebase 版新增 */
+.status-row { margin-top: 10px; }
+.pill.ok { color: var(--success); border-color: rgba(134,239,172,.45); }
+.pill.warn { color: var(--warn); border-color: rgba(251,191,36,.45); }
+.pill.bad { color: var(--danger); border-color: rgba(251,113,133,.45); }
+.submit-msg { font-weight: 900; font-size: 16px; }
+.student-card .pill { white-space: normal; text-align: left; }

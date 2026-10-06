@@ -1,0 +1,59 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "sessions": {
+      "$sid": {
+        "meta": {
+          ".read": "auth != null",
+          ".write": "auth != null && $sid.matches(/^[A-Za-z0-9_-]{6,40}$/) && (!data.exists() || data.child('ownerUid').val() === auth.uid)",
+          ".validate": "newData.hasChildren(['ownerUid', 'createdAt']) && newData.child('ownerUid').val() === auth.uid",
+          "ownerUid": { ".validate": "newData.isString()" },
+          "createdAt": { ".validate": "newData.isNumber()" },
+          "title": { ".validate": "newData.isString() && newData.val().length <= 100" },
+          "$other": { ".validate": false }
+        },
+        "state": {
+          ".read": "auth != null",
+          ".write": "auth != null && root.child('sessions').child($sid).child('meta').child('ownerUid').val() === auth.uid",
+          ".validate": "newData.hasChildren(['title', 'groups', 'groupSet', 'reportOrder', 'questionOrder', 'currentIndex', 'currentRoundKey', 'phase', 'timer'])",
+          "currentRoundKey": { ".validate": "newData.isString() && newData.val().matches(/^[0-9]{1,2}$/)" },
+          "currentIndex": { ".validate": "newData.isNumber()" },
+          "movedTo": { ".validate": "newData.isString() && newData.val().matches(/^[A-Za-z0-9_-]{6,40}$/)" }
+        },
+        "presence": {
+          ".read": "auth != null && root.child('sessions').child($sid).child('meta').child('ownerUid').val() === auth.uid",
+          "$uid": {
+            ".write": "auth != null && auth.uid === $uid && root.child('sessions').child($sid).child('meta').exists()",
+            ".validate": "newData.isNumber()"
+          }
+        },
+        "scores": {
+          ".read": "auth != null && root.child('sessions').child($sid).child('meta').child('ownerUid').val() === auth.uid",
+          ".write": "auth != null && root.child('sessions').child($sid).child('meta').child('ownerUid').val() === auth.uid",
+          "$round": {
+            "$key": {
+              ".write": "auth != null && newData.exists() && root.child('sessions').child($sid).child('meta').exists() && !root.child('sessions').child($sid).child('state').child('movedTo').exists() && $round === root.child('sessions').child($sid).child('state').child('currentRoundKey').val() && (!data.exists() || data.child('uid').val() === auth.uid)",
+              ".validate": "newData.hasChildren(['scorerGroup', 'seatNo', 'reportScores', 'reportScore', 'questionScore', 'submittedAt', 'uid']) && $key === newData.child('scorerGroup').val() + '::' + newData.child('seatNo').val() && root.child('sessions').child($sid).child('state').child('groupSet').child(newData.child('scorerGroup').val()).exists() && newData.child('scorerGroup').val() !== root.child('sessions').child($sid).child('state').child('reportOrder').child($round).val() && newData.child('scorerGroup').val() !== root.child('sessions').child($sid).child('state').child('questionOrder').child($round).val() && (newData.child('uid').val() === auth.uid || root.child('sessions').child($sid).child('meta').child('ownerUid').val() === auth.uid)",
+              "scorerGroup": { ".validate": "newData.isString() && newData.val().length >= 1 && newData.val().length <= 40" },
+              "seatNo": { ".validate": "newData.isString() && newData.val().length >= 1 && newData.val().length <= 12" },
+              "reportScores": {
+                ".validate": "newData.hasChildren(['inquiryDesign', 'evidenceAnalysis', 'communication'])",
+                "inquiryDesign": { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 10" },
+                "evidenceAnalysis": { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 10" },
+                "communication": { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 10" },
+                "$other": { ".validate": false }
+              },
+              "reportScore": { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 10" },
+              "questionScore": { ".validate": "newData.isNumber() && newData.val() >= 1 && newData.val() <= 10" },
+              "comment": { ".validate": "newData.isString() && newData.val().length <= 500" },
+              "submittedAt": { ".validate": "newData.isNumber() || newData.isString()" },
+              "uid": { ".validate": "newData.isString() && newData.val().length <= 128" },
+              "$other": { ".validate": false }
+            }
+          }
+        }
+      }
+    }
+  }
+}

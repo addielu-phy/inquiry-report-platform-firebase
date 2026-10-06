@@ -5,14 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>探究與實作期末報告平台</title>
   <meta name="description" content="探究與實作期末報告：抽籤排序、QR 即時評分、三向度報告評量、計時、平均分數與 Excel 匯出平台。" />
+  <link rel="icon" href="data:," />
   <link rel="stylesheet" href="src/styles.css" />
-  <script defer src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
-  <script defer src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-  <script defer src="src/app.js"></script>
+  <!-- 只載入主程式（ES module）。Firebase 由 app.js 動態載入；QR／Excel 套件只在老師端需要時才載入。 -->
+  <script type="module" src="src/app.js"></script>
 </head>
 <body>
   <div id="app" class="app-shell">
+    <p id="bootMsg" class="notice">載入中…若一直停在這裡，請確認網路後重新整理；瀏覽器版本過舊（例如 iOS 13 以前）也可能無法使用。</p>
+    <script nomodule>document.getElementById('bootMsg').textContent = '你的瀏覽器版本太舊，無法使用本平台，請改用新版 Safari / Chrome。';</script>
     <header class="hero">
       <div>
         <p class="eyebrow">Inquiry & Practice Live Assessment</p>
@@ -20,15 +21,15 @@
         <p class="lead">抽籤排序、QR 即時評分、座號紀錄、三向度報告評量、報告／提問／換場計時與 Excel 匯出。</p>
       </div>
       <div class="hero-badge">
-        <span>GitHub Pages 穩定版</span>
-        <strong>免安裝</strong>
+        <span>GitHub Pages + Firebase</span>
+        <strong>即時收分</strong>
       </div>
     </header>
 
     <main id="teacherApp" class="mode-panel hidden">
       <section class="notice">
-        <strong>使用方式：</strong>老師先設定班級組數與組別，按「儲存並抽籤」，再按「建立即時收分 Session」投影 QR Code。學生填組別與座號後評分，分數會即時送回老師這個瀏覽器分頁。
-        <br />提醒：公開網站版資料存在老師瀏覽器，活動結束請務必匯出 Excel／JSON。若學校網路阻擋 WebRTC，請改用 repo 內的本機 LAN 版。
+        <strong>使用方式：</strong>老師先設定班級組數與組別，按「儲存並抽籤」，再按「建立即時收分 Session」投影 QR Code。學生填組別與座號後評分，分數透過 Firebase Realtime Database 即時送回（學生用學校 Wi-Fi 或自己的 4G／5G 都可以）。
+        <br />提醒：重新整理老師頁面會自動恢復同一個 Session 與 QR；評分同時備份在老師瀏覽器。活動結束請務必下載 Excel／JSON。
       </section>
 
       <section class="grid two">
@@ -58,7 +59,10 @@
         <div class="card">
           <h2>② 學生 QR Code</h2>
           <div class="session-row">
-            <button id="startSessionBtn" class="primary">建立即時收分 Session</button>
+            <button id="startSessionBtn" class="primary">建立／恢復即時收分 Session</button>
+            <button id="newSessionBtn">開新 Session（新 QR）</button>
+          </div>
+          <div class="session-row status-row">
             <span id="sessionStatus" class="pill muted">尚未建立</span>
           </div>
           <div class="qr-layout">
@@ -67,7 +71,7 @@
               <p class="hint">學生網址</p>
               <div id="studentUrl" class="urlbox">尚未建立 session</div>
               <button id="copyStudentUrlBtn">複製學生網址</button>
-              <p class="hint">已連線學生裝置：<strong id="connectionCount">0</strong></p>
+              <p class="hint">目前在線學生裝置：<strong id="connectionCount">0</strong></p>
             </div>
           </div>
         </div>
@@ -150,7 +154,7 @@
         <label>你的組別</label>
         <select id="studentGroupSelect"></select>
         <label>你的座號</label>
-        <input id="studentSeatNo" type="text" inputmode="numeric" autocomplete="off" placeholder="例如：12" />
+        <input id="studentSeatNo" type="text" inputmode="numeric" autocomplete="off" maxlength="12" placeholder="例如：12" />
         <p id="eligibilityMsg" class="notice mini">請先選擇你的組別並填寫座號。</p>
       </section>
 
@@ -178,7 +182,8 @@
         <label>備註（可不填）</label>
         <textarea id="studentComment" class="student-comment" placeholder="例如：問題具體、報告資料清楚、變因可再說明……"></textarea>
         <button id="submitScoreBtn" class="primary wide">送出／更新本輪評分</button>
-        <p id="submitMsg" class="hint"></p>
+        <p id="submitMsg" class="hint submit-msg" aria-live="polite"></p>
+        <p class="hint">畫面卡住時直接重新整理即可，組別與座號會自動帶入；重複送出只會更新自己這一筆。</p>
       </section>
     </main>
   </div>
