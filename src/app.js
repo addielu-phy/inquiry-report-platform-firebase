@@ -530,20 +530,83 @@ function mmss(sec) {
   return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`;
 }
 
+// Web Audio 課堂鈴聲：共用 AudioContext，首次點擊／觸控後解鎖（符合手機自動播放政策）
+let audioCtx = null;
+let audioUnlockInstalled = false;
+let studentLastDoneKey = '';
+
+function getAudioCtx() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch (e) { console.warn(e); return null; }
+  }
+  return audioCtx;
+}
+
+function unlockAudio() {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  try {
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    // iOS：極短靜音 buffer 有助於真正解鎖
+    const buf = ctx.createBuffer(1, 1, 22050);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start(0);
+  } catch (e) { console.warn(e); }
+}
+
+function installAudioUnlock() {
+  if (audioUnlockInstalled) return;
+  audioUnlockInstalled = true;
+  const unlock = () => unlockAudio();
+  for (const ev of ['pointerdown', 'touchstart', 'keydown']) {
+    document.addEventListener(ev, unlock, { capture: true, passive: true });
+  }
+}
+
+/** 課堂鈴聲：上行大調琶音（G5–B5–D6–G6），結束時清楚可辨 */
 function bell() {
   try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    [0, 0.22, 0.44].forEach((delay) => {
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const tones = [
+      { f: 784, at: 0, dur: 0.2 },
+      { f: 988, at: 0.18, dur: 0.2 },
+      { f: 1175, at: 0.36, dur: 0.22 },
+      { f: 1568, at: 0.58, dur: 0.45 },
+    ];
+    for (const { f, at, dur } of tones) {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
-      osc.frequency.value = 880;
-      gain.gain.setValueAtTime(0.0001, ctx.currentTime + delay);
-      gain.gain.exponentialRampToValueAtTime(0.32, ctx.currentTime + delay + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + delay + 0.18);
-      osc.connect(gain); gain.connect(ctx.destination);
-      osc.start(ctx.currentTime + delay); osc.stop(ctx.currentTime + delay + 0.2);
-    });
+      osc.type = 'sine';
+      osc.frequency.value = f;
+      const start = ctx.currentTime + at;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.38, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(start);
+      osc.stop(start + dur + 0.03);
+    }
   } catch (e) { console.warn(e); }
+}
+
+/** 倒數到 0 時響一次（以 phase+endsAt 去重；老師／學生各自追蹤） */
+function maybeBellWhenDone(tv, which) {
+  if (!(tv.running && tv.done && tv.endsAt)) return;
+  const key = `${tv.phase}:${tv.endsAt}`;
+  if (which === 'student') {
+    if (key === studentLastDoneKey) return;
+    studentLastDoneKey = key;
+  } else {
+    if (key === lastDoneKey) return;
+    lastDoneKey = key;
+  }
+  bell();
 }
 
 // ---------------------------------------------------------------- 老師端
@@ -565,6 +628,7 @@ function setTeacherStatus(text, kind = 'muted') {
 }
 
 function startPhase(phase, duration) {
+  unlockAudio();
   state.phase = phase;
   const start = serverNow();
   state.timer = { running: true, phase, duration, startedAt: start, endsAt: start + duration * 1000 };
@@ -581,6 +645,7 @@ function updateGroupCountHint() {
 }
 
 function setupTeacher() {
+  installAudioUnlock();
   $('teacherApp').classList.remove('hidden');
   $('titleInput').value = state.title;
   $('groupsInput').value = state.groups.join('\n');
@@ -817,10 +882,7 @@ function renderTeacher(updateInputs = true) {
   $('reportGroup').textContent = cr.reportGroup || '—';
   $('questionGroup').textContent = cr.questionGroup || '—';
   $('connectionCount').textContent = String(teacher.presenceCount);
-  if (tv.running && tv.done) {
-    const key = `${tv.phase}:${tv.endsAt}`;
-    if (key !== lastDoneKey) { lastDoneKey = key; bell(); }
-  }
+  maybeBellWhenDone(tv, 'teacher');
   const cs = cr.total ? roundStats(cr.index) : null;
   $('reportAvg').textContent = scoreText(cs?.reportAvg);
   $('questionAvg').textContent = scoreText(cs?.questionAvg);
@@ -979,6 +1041,7 @@ function setSubmitMsg(text, kind = 'muted') {
 }
 
 async function setupStudent() {
+  installAudioUnlock();
   $('studentApp').classList.remove('hidden');
   const saved = loadStudentIdentity();
   $('studentSeatNo').value = safeText(saved.seatNo);
@@ -988,9 +1051,9 @@ async function setupStudent() {
     input.oninput = () => { text.textContent = input.value; };
   }
   $('studentQuestionScore').oninput = () => { $('studentQuestionScoreText').textContent = $('studentQuestionScore').value; };
-  $('studentGroupSelect').onchange = () => { saveStudentIdentity(); renderStudentEligibility(); };
-  $('studentSeatNo').addEventListener('input', () => { saveStudentIdentity(); renderStudentEligibility(); });
-  $('submitScoreBtn').onclick = submitStudentScore;
+  $('studentGroupSelect').onchange = () => { unlockAudio(); saveStudentIdentity(); renderStudentEligibility(); };
+  $('studentSeatNo').addEventListener('input', () => { unlockAudio(); saveStudentIdentity(); renderStudentEligibility(); });
+  $('submitScoreBtn').onclick = () => { unlockAudio(); submitStudentScore(); };
   $('submitScoreBtn').disabled = true;
   window.addEventListener('online', renderStudentConn);
   window.addEventListener('offline', renderStudentConn);
@@ -1086,6 +1149,7 @@ function renderStudentTimer() {
   const cr = currentRound(s);
   const tv = timerView(s);
   $('studentRoundInfo').textContent = cr.total ? `第 ${cr.roundNo} / ${cr.total} 輪｜${tv.label}｜剩餘 ${mmss(tv.remaining)}` : '尚未開始';
+  maybeBellWhenDone(tv, 'student');
 }
 
 function renderStudent() {
