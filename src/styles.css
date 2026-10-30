@@ -173,3 +173,19 @@ tr.conflict td { background: rgba(251,113,133,.14); }
 .duration-row label { margin: 0; display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
 .duration-row select { width: auto; min-width: 150px; padding: 9px 12px; }
 .duration-row .hint { flex-basis: 100%; text-align: center; margin: 0; }
+
+/* 跨週接續與排除重抽 */
+.activity-list { display: grid; gap: 10px; margin-top: 14px; max-height: 360px; overflow: auto; }
+.activity-item { display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 16px; padding: 12px 14px; background: rgba(0,0,0,.18); }
+.activity-item.current { border-color: rgba(134,239,172,.55); }
+.activity-item .hint { margin: 4px 0 0; font-size: 13px; }
+.activity-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.activity-btns button { padding: 8px 12px; }
+.exclusion-grid { display: grid; gap: 4px; margin-top: 12px; max-height: 320px; overflow: auto; border: 1px solid var(--line); border-radius: 14px; padding: 6px 10px; }
+.ex-row { display: grid; grid-template-columns: 1fr 80px 80px; align-items: center; gap: 6px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,.06); }
+.ex-row.ex-head { font-weight: 900; color: var(--muted); }
+.ex-row.is-presented span { color: var(--muted); text-decoration: line-through; }
+.ex-check { margin: 0; text-align: center; }
+.ex-check input { width: 22px; height: 22px; accent-color: #14b8a6; }
+tr.done-row td { color: var(--muted); }
+#bellHint button { padding: 6px 10px; margin-left: 8px; }

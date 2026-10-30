@@ -6,14 +6,14 @@
   <title>探究與實作上台報告平台</title>
   <meta name="description" content="探究與實作上台報告：抽籤排序、QR 即時評分、三向度報告評量、計時、平均分數與 Excel 匯出平台。" />
   <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="src/styles.css" />
+  <link rel="stylesheet" href="src/styles.css?v=20261030" />
   <!-- 預先下載 Firebase SDK（與 src/app.js 的 FIREBASE_SDK_VERSION 必須一致），與主程式同時開始下載，縮短學生端首次連線時間 -->
   <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js" />
   <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/12.19.0/firebase-database.js" />
   <link rel="modulepreload" href="https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js" />
   <link rel="preconnect" href="https://identitytoolkit.googleapis.com" crossorigin />
   <!-- 只載入主程式（ES module）。Firebase 由 app.js 動態載入；QR／Excel 套件只在老師端需要時才載入。 -->
-  <script type="module" src="src/app.js"></script>
+  <script type="module" src="src/app.js?v=20261030"></script>
 </head>
 <body>
   <div id="app" class="app-shell">
@@ -82,6 +82,37 @@
         </div>
       </section>
 
+      <section class="grid two">
+        <div class="card">
+          <h2>⑤ 儲存進度／叫出活動（隔週接續）</h2>
+          <p class="hint">建立 Session 後，抽籤順序、誰已報告／已提問、所有評分都會自動儲存（雲端 Firebase＋這台電腦）。下週打開本頁，在下方清單按「叫出來繼續」即可接著用，學生掃同一個 QR 也能接上。</p>
+          <div class="actions">
+            <button id="saveActivityBtn" class="primary" type="button">💾 儲存目前進度</button>
+            <button id="newActivityBtn" type="button">＋ 開始新活動（另一班／新報告）</button>
+          </div>
+          <div id="activityList" class="activity-list"></div>
+          <p class="hint">清單存在這台電腦的瀏覽器。換電腦時：先在原電腦「下載 JSON 備份」，到新電腦「匯入 JSON」，再建立 Session 即可接續。</p>
+        </div>
+
+        <div class="card">
+          <h2>⑥ 排除已報告／已提問組別，重新抽籤</h2>
+          <p class="hint">系統會依紀錄自動勾選上一節課已報告、已提問的組別，也可以手動修改。按「排除後重新抽籤」只會抽剩下的組別；已完成的輪次與分數都保留。</p>
+          <div class="session-row"><span id="exclusionMode" class="pill ok">依紀錄自動帶入</span>
+            <button id="autoExclusionBtn" type="button">依紀錄重新帶入</button>
+            <button id="clearExclusionBtn" type="button" class="danger-outline">全部取消勾選</button>
+          </div>
+          <label>已報告的組（輸入組號，例如 1,3,5 或 1-4）</label>
+          <input id="presentedInput" type="text" inputmode="text" placeholder="例如：1,3,5" />
+          <label>已提問的組（輸入組號）</label>
+          <input id="askedInput" type="text" inputmode="text" placeholder="例如：2,4,6" />
+          <div id="exclusionGrid" class="exclusion-grid"></div>
+          <div id="remainingInfo" class="notice mini ok"></div>
+          <div class="actions">
+            <button id="redrawBtn" class="success" type="button">🎲 排除後重新抽籤（下一堂課用）</button>
+          </div>
+        </div>
+      </section>
+
       <section class="card stage-card">
         <div class="stage-head">
           <div>
@@ -91,7 +122,7 @@
           <div class="timer" id="timerText">00:00</div>
         </div>
         <div class="progress"><div id="timerBar" class="bar"></div></div>
-        <p class="hint" id="bellHint">倒數結束會響鈴提醒（課堂鈴聲）。若手機無聲，請先點一下頁面以啟用音效。</p>
+        <p class="hint" id="bellHint">倒數結束會連響 3 次鈴聲，剩 30 秒會短嗶兩聲提醒。若沒有聲音，請先點一下頁面，並把電腦音量開大。 <button id="testBellBtn" type="button">🔔 測試鈴聲</button></p>
         <div class="role-grid">
           <div class="role-box report">
             <span>上台報告組別</span>

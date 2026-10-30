@@ -10,6 +10,7 @@ const XLSX_URL = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
 const LS_KEY = 'inquiryPracticeReportPlatform.v2';
 const STUDENT_ID_KEY = 'inquiryPracticeReportPlatform.studentIdentity.v1';
 const SESSION_KEY = 'inquiryPracticeReportPlatform.firebaseSessionId.v1';
+const ACTIVITIES_KEY = 'inquiryPracticeReportPlatform.activities.v1'; // 已儲存活動清單（跨週接續用）
 const DEFAULT_GROUP_COUNT = 9;
 const SUBMIT_TIMEOUT_MS = 8000;
 const NET_TIMEOUT_MS = 25000; // 老師端單次讀寫的等待上限
@@ -289,6 +290,7 @@ function defaultState() {
     phase: 'setup',
     timer: { running: false, phase: 'setup', duration: 0, startedAt: null, endsAt: null },
     durations: normalizeDurations(),
+    exclusion: { presented: [], asked: [], manual: false },
     scores: {},
     updatedAt: new Date().toISOString(),
   };
@@ -321,7 +323,20 @@ function normalizeLoadedState(parsed, base = defaultState()) {
     currentIndex: clamp(Number(parsed.currentIndex || 0), 0, Math.max(0, groups.length - 1)),
     timer: parsed.timer || base.timer,
     durations: normalizeDurations(parsed.durations),
+    exclusion: normalizeExclusion(parsed.exclusion, groups),
     scores: normalizeScoresTree(parsed.scores),
+  };
+}
+
+function toList(v) { return Array.isArray(v) ? v : v && typeof v === 'object' ? Object.values(v) : []; }
+function normalizeExclusion(ex, groups) {
+  const gs = new Set(groups || []);
+  return {
+    presented: toList(ex?.presented).map(safeGroupName).filter((g) => gs.has(g)),
+    asked: toList(ex?.asked).map(safeGroupName).filter((g) => gs.has(g)),
+    manual: Boolean(ex?.manual),
+    basePresented: toList(ex?.basePresented).map(safeGroupName).filter((g) => gs.has(g)),
+    baseAsked: toList(ex?.baseAsked).map(safeGroupName).filter((g) => gs.has(g)),
   };
 }
 
@@ -338,6 +353,7 @@ function normalizeScoresTree(val) {
 function saveLocal() {
   state.updatedAt = new Date().toISOString();
   try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch (e) { console.warn(e); }
+  recordActivity();
 }
 
 // 老師端每次改動：存到 localStorage（備份）並同步公開狀態到 Firebase
@@ -490,6 +506,7 @@ function publicState() {
       endsAt: Number.isFinite(Number(t.endsAt)) && t.endsAt !== null ? Number(t.endsAt) : null,
     },
     durations: normalizeDurations(state.durations),
+    exclusion: { presented: state.exclusion?.presented || [], asked: state.exclusion?.asked || [], manual: Boolean(state.exclusion?.manual), basePresented: state.exclusion?.basePresented || [], baseAsked: state.exclusion?.baseAsked || [] },
     updatedAt: new Date().toISOString(),
   };
 }
@@ -566,39 +583,106 @@ function installAudioUnlock() {
   }
 }
 
-/** 課堂鈴聲：上行大調琶音（G5–B5–D6–G6），結束時清楚可辨 */
-function bell() {
+// 主輸出：前級增益 → 壓縮／限幅器 → 喇叭。讓鈴聲又大聲又不破音（投影筆電喇叭也聽得清楚）
+let audioOut = null;
+function getAudioOut(ctx) {
+  if (audioOut && audioOut.ctx === ctx) return audioOut.input;
+  const input = ctx.createGain();
+  input.gain.value = 1.8;
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -14;
+  comp.knee.value = 4;
+  comp.ratio.value = 16;
+  comp.attack.value = 0.002;
+  comp.release.value = 0.12;
+  const makeup = ctx.createGain();
+  makeup.gain.value = 1.9;
+  const limiter = ctx.createDynamicsCompressor(); // 第二級當限幅器，避免削波
+  limiter.threshold.value = -1;
+  limiter.knee.value = 0;
+  limiter.ratio.value = 20;
+  limiter.attack.value = 0.001;
+  limiter.release.value = 0.05;
+  input.connect(comp); comp.connect(makeup); makeup.connect(limiter); limiter.connect(ctx.destination);
+  audioOut = { ctx, input };
+  return input;
+}
+
+// 一個「響亮的音」：正弦基音＋八度泛音＋少量方波（人耳對 1–3 kHz 最敏感，小喇叭也放得出來）
+function loudTone(ctx, out, f, start, dur, peak = 0.9) {
+  const layers = [
+    { type: 'sine', mul: 1, g: 1 },
+    { type: 'sine', mul: 2, g: 0.35 },
+    { type: 'square', mul: 1, g: 0.12 },
+    { type: 'triangle', mul: 3, g: 0.12 },
+  ];
+  for (const l of layers) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = l.type;
+    osc.frequency.value = f * l.mul;
+    const p = Math.max(0.0002, peak * l.g);
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(p, start + 0.012);
+    gain.gain.setValueAtTime(p, start + Math.max(0.02, dur * 0.55));
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+    osc.connect(gain); gain.connect(out);
+    osc.start(start); osc.stop(start + dur + 0.05);
+  }
+}
+
+/** 課堂鈴聲：上行大調琶音（G5–B5–D6–G6），結束時連響 3 次、開始時響 1 次 */
+function bell(repeats = 1) {
   try {
     const ctx = getAudioCtx();
     if (!ctx) return;
     if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const out = getAudioOut(ctx);
     const tones = [
-      { f: 784, at: 0, dur: 0.2 },
-      { f: 988, at: 0.18, dur: 0.2 },
-      { f: 1175, at: 0.36, dur: 0.22 },
-      { f: 1568, at: 0.58, dur: 0.45 },
+      { f: 784, at: 0, dur: 0.22 },
+      { f: 988, at: 0.2, dur: 0.22 },
+      { f: 1175, at: 0.4, dur: 0.24 },
+      { f: 1568, at: 0.62, dur: 0.7 },
     ];
-    for (const { f, at, dur } of tones) {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'sine';
-      osc.frequency.value = f;
-      const start = ctx.currentTime + at;
-      gain.gain.setValueAtTime(0.0001, start);
-      gain.gain.exponentialRampToValueAtTime(0.38, start + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, start + dur);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(start);
-      osc.stop(start + dur + 0.03);
+    const gap = 1.45;
+    for (let r = 0; r < repeats; r++) {
+      for (const { f, at, dur } of tones) loudTone(ctx, out, f, ctx.currentTime + 0.03 + r * gap + at, dur);
     }
   } catch (e) { console.warn(e); }
 }
 
-/** 倒數到 0 時響一次（以 phase+endsAt 去重；老師／學生各自追蹤） */
+/** 剩 30 秒提醒：兩聲短嗶 */
+function warnBeep() {
+  try {
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const out = getAudioOut(ctx);
+    const t = ctx.currentTime + 0.03;
+    loudTone(ctx, out, 1319, t, 0.16, 0.8);
+    loudTone(ctx, out, 1319, t + 0.26, 0.16, 0.8);
+  } catch (e) { console.warn(e); }
+}
+
+const END_BELL_REPEATS = 3;
+let lastWarnKey = '';
+
+/** 倒數到 0 時連響 3 次（以 phase+endsAt 去重；老師／學生各自追蹤）；老師端剩 30 秒時短嗶提醒 */
 function maybeBellWhenDone(tv, which) {
-  if (!(tv.running && tv.done && tv.endsAt)) return;
+  if (!(tv.running && tv.endsAt)) return;
   const key = `${tv.phase}:${tv.endsAt}`;
+  if (!tv.done) {
+    if (which === 'teacher' && tv.duration >= 60 && tv.remaining <= 30 && tv.remaining >= 27 && key !== lastWarnKey) {
+      lastWarnKey = key;
+      warnBeep();
+    }
+    return;
+  }
+  // 太久以前就結束的計時（例如重新整理或叫出舊活動）不再響
+  if (serverNow() - Number(tv.endsAt) > 15000) {
+    if (which === 'student') studentLastDoneKey = key; else lastDoneKey = key;
+    return;
+  }
   if (which === 'student') {
     if (key === studentLastDoneKey) return;
     studentLastDoneKey = key;
@@ -606,7 +690,7 @@ function maybeBellWhenDone(tv, which) {
     if (key === lastDoneKey) return;
     lastDoneKey = key;
   }
-  bell();
+  bell(END_BELL_REPEATS);
 }
 
 // ---------------------------------------------------------------- 老師端
@@ -634,7 +718,7 @@ function startPhase(phase, duration) {
   state.timer = { running: true, phase, duration, startedAt: start, endsAt: start + duration * 1000 };
   saveState();
   renderTeacher();
-  bell();
+  bell(1);
 }
 
 function updateGroupCountHint() {
@@ -664,7 +748,7 @@ function setupTeacher() {
     if (groups.length < 2) return alert('至少需要 2 個組別。');
     if (hasAnyScores(state.scores) && !confirm('重新抽籤會清空目前所有評分資料（建議先下載 Excel／JSON）。確定繼續？')) return;
     const [reportOrder, questionOrder] = makeDerangedOrders(groups);
-    state = { ...state, schemaVersion: 3, title: safeText($('titleInput').value) || '探究與實作上台報告', groups, reportOrder, questionOrder, currentIndex: 0, scores: {}, phase: 'setup', timer: { running: false, phase: 'setup', duration: 0, startedAt: null, endsAt: null } };
+    state = { ...state, schemaVersion: 3, title: safeText($('titleInput').value) || '探究與實作上台報告', groups, reportOrder, questionOrder, currentIndex: 0, scores: {}, exclusion: { presented: [], asked: [], manual: false }, phase: 'setup', timer: { running: false, phase: 'setup', duration: 0, startedAt: null, endsAt: null } };
     saveState(); clearRemoteScores(); renderTeacher();
   };
   $('reshuffleBtn').onclick = () => {
@@ -674,6 +758,7 @@ function setupTeacher() {
     const [reportOrder, questionOrder] = makeDerangedOrders(groups);
     state.groups = groups;
     state.reportOrder = reportOrder; state.questionOrder = questionOrder; state.currentIndex = 0; state.scores = {}; state.phase = 'setup';
+    state.exclusion = { presented: [], asked: [], manual: false };
     state.timer = { running: false, phase: 'setup', duration: 0, startedAt: null, endsAt: null };
     saveState(); clearRemoteScores(); renderTeacher();
   };
@@ -714,6 +799,7 @@ function setupTeacher() {
   $('exportXlsxBtn').onclick = exportXlsx;
   $('exportJsonBtn').onclick = exportJson;
   $('importJsonInput').onchange = importJson;
+  setupContinuation();
   renderTeacher();
   setInterval(() => { renderTeacher(false); }, 1000);
 
@@ -889,7 +975,7 @@ function renderTeacher(updateInputs = true) {
   for (const criterion of REPORT_CRITERIA) $(criterion.avgId).textContent = scoreText(cs?.reportCriteriaAvgs?.[criterion.key]);
   $('scoreCount').textContent = cs ? `${cs.responseCount}人 / ${cs.submittedGroupCount}/${cs.expectedCount}組` : '0人 / 0組';
   $('missingGroups').textContent = `未評分組別：${cs?.missingGroups?.join('、') || '—'}`;
-  renderOrderTable(); renderStatsTable();
+  renderOrderTable(); renderStatsTable(); renderExclusion();
 }
 
 function renderRows(tableId, rows) {
@@ -897,10 +983,12 @@ function renderRows(tableId, rows) {
 }
 
 function renderOrderTable() {
-  const rows = [['順位', '上台報告', '負責提問', '檢查']];
+  const rows = [['順位', '上台報告', '負責提問', '檢查', '進度']];
   const total = Math.min(state.reportOrder.length, state.questionOrder.length);
-  for (let i = 0; i < total; i++) rows.push([i + 1, state.reportOrder[i], state.questionOrder[i], state.reportOrder[i] === state.questionOrder[i] ? '衝突' : 'OK']);
-  $('orderTable').innerHTML = rows.map((r, i) => `<tr class="${i && r[3] !== 'OK' ? 'conflict' : ''}">${r.map((c) => (i ? `<td>${escapeHtml(c)}</td>` : `<th>${escapeHtml(c)}</th>`)).join('')}</tr>`).join('');
+  const done = doneRoundSet();
+  const cur = currentRound().index;
+  for (let i = 0; i < total; i++) rows.push([i + 1, state.reportOrder[i], state.questionOrder[i], state.reportOrder[i] === state.questionOrder[i] ? '衝突' : 'OK', done.has(i) ? '✅ 已完成' : i === cur ? '▶ 本輪' : '待報告']);
+  $('orderTable').innerHTML = rows.map((r, i) => `<tr class="${i && r[3] !== 'OK' ? 'conflict' : i && r[4].startsWith('✅') ? 'done-row' : ''}">${r.map((c) => (i ? `<td>${escapeHtml(c)}</td>` : `<th>${escapeHtml(c)}</th>`)).join('')}</tr>`).join('');
 }
 
 function renderStatsTable() {
@@ -982,11 +1070,341 @@ function importJson(ev) {
       saveLocal();
       renderTeacher();
       if (teacher.sessionId) { await pushPublicState(); await uploadAllScores(); }
-      alert('已匯入備份。');
+      renderActivities();
+      alert(teacher.sessionId ? '已匯入備份，並同步到目前的 QR Session。' : '已匯入備份。請按「建立／恢復即時收分 Session」開始收分。');
     } catch (e) { alert('匯入失敗：' + e.message); }
     ev.target.value = '';
   };
   reader.readAsText(file, 'utf-8');
+}
+
+// ---------------------------------------------------------------- 跨週接續：已儲存活動
+
+function loadActivities() {
+  try { const v = JSON.parse(localStorage.getItem(ACTIVITIES_KEY) || '{}'); return v && typeof v === 'object' ? v : {}; } catch (_) { return {}; }
+}
+function storeActivities(list) {
+  try { localStorage.setItem(ACTIVITIES_KEY, JSON.stringify(list)); } catch (e) { console.warn(e); }
+}
+
+// 每次老師端資料變動都自動記錄到「已儲存活動」（以 Session ID 為鍵；資料本身也在 Firebase）
+function recordActivity(force = false) {
+  if (isStudentMode) return;
+  const id = teacher.sessionId;
+  if (!id) return;
+  const list = loadActivities();
+  const total = Math.min(state.reportOrder.length, state.questionOrder.length);
+  list[id] = {
+    id,
+    title: state.title || '探究與實作上台報告',
+    updatedAt: Date.now(),
+    createdAt: list[id]?.createdAt || Date.now(),
+    doneRounds: doneRoundSet().size,
+    totalRounds: total,
+    groupCount: state.groups.length,
+    snapshot: { ...state, timer: { running: false, phase: 'setup', duration: 0, startedAt: null, endsAt: null } },
+  };
+  storeActivities(list);
+  scheduleRenderActivities();
+}
+
+let renderActTimer = null;
+function scheduleRenderActivities() {
+  if (renderActTimer) return;
+  renderActTimer = setTimeout(() => { renderActTimer = null; renderActivities(); }, 300);
+}
+
+function renderActivities() {
+  const box = $('activityList');
+  if (!box) return;
+  const items = Object.values(loadActivities()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  if (!items.length) { box.innerHTML = '<p class="hint">還沒有儲存的活動。建立 Session 後會自動儲存，也可以按「儲存目前進度」。</p>'; return; }
+  box.innerHTML = items.map((a) => {
+    const current = a.id === teacher.sessionId;
+    const remain = Math.max(0, (a.totalRounds || 0) - (a.doneRounds || 0));
+    return `<div class="activity-item${current ? ' current' : ''}">
+      <div>
+        <strong>${escapeHtml(a.title)}</strong>${current ? ' <span class="pill ok">使用中</span>' : ''}
+        <div class="hint">最後更新：${escapeHtml(formatTime(a.updatedAt))}｜${a.groupCount || 0} 組｜已完成 ${a.doneRounds || 0} / ${a.totalRounds || 0} 輪（剩 ${remain} 組）｜ID ${escapeHtml(a.id)}</div>
+      </div>
+      <div class="activity-btns">
+        ${current ? '' : `<button type="button" class="primary" data-act="load" data-id="${escapeHtml(a.id)}">叫出來繼續</button>`}
+        <button type="button" class="danger-outline" data-act="remove" data-id="${escapeHtml(a.id)}">從清單移除</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function setupContinuation() {
+  $('saveActivityBtn').onclick = saveActivityNow;
+  $('newActivityBtn').onclick = startNewActivity;
+  $('activityList').onclick = (ev) => {
+    const btn = ev.target.closest('button[data-act]');
+    if (!btn) return;
+    const id = btn.dataset.id;
+    if (btn.dataset.act === 'load') loadActivity(id);
+    if (btn.dataset.act === 'remove') {
+      const a = loadActivities()[id];
+      if (!confirm(`從清單移除「${a?.title || id}」？（只移除這台電腦上的清單，不會刪除已下載的 Excel／JSON）`)) return;
+      const list = loadActivities(); delete list[id]; storeActivities(list); renderActivities();
+    }
+  };
+  $('testBellBtn').onclick = () => { unlockAudio(); bell(1); };
+  // 排除與重新抽籤
+  $('exclusionGrid').onchange = (ev) => {
+    if (!ev.target.matches('input[type=checkbox]')) return;
+    const presented = []; const asked = [];
+    for (const cb of $('exclusionGrid').querySelectorAll('input[type=checkbox]:checked')) (cb.dataset.kind === 'presented' ? presented : asked).push(cb.dataset.group);
+    setExclusion(presented, asked, true);
+  };
+  const onText = () => {
+    setExclusion(parseGroupRefs($('presentedInput').value), parseGroupRefs($('askedInput').value), true, { keepText: true });
+  };
+  $('presentedInput').addEventListener('change', onText);
+  $('askedInput').addEventListener('change', onText);
+  $('presentedInput').addEventListener('input', onText);
+  $('askedInput').addEventListener('input', onText);
+  $('autoExclusionBtn').onclick = () => { state.exclusion = { ...state.exclusion, ...autoExclusion(), manual: false }; exclusionKey = ''; saveState(); renderTeacher(false); };
+  $('clearExclusionBtn').onclick = () => { setExclusion([], [], true); };
+  $('redrawBtn').onclick = redrawExcluding;
+  renderActivities();
+}
+
+async function saveActivityNow() {
+  const title = safeText($('titleInput').value);
+  if (title) state.title = title;
+  if (!teacher.sessionId) {
+    saveLocal();
+    await createSession();
+    if (!teacher.sessionId) return alert('尚未建立 Session，無法儲存到雲端；本機仍有備份，也可以先下載 JSON。');
+  } else {
+    saveState();
+  }
+  recordActivity(true);
+  renderActivities();
+  setTeacherStatus(`已儲存「${state.title}」（${formatTime(Date.now())}）`, 'ok');
+  setTimeout(() => { if (teacher.sessionId) setTeacherStatus(teacher.connected ? `即時收分中：${teacher.sessionId}` : `暫時離線，網路恢復後自動同步（${teacher.sessionId}）`, teacher.connected ? 'ok' : 'warn'); }, 4000);
+}
+
+async function startNewActivity() {
+  const title = prompt('新活動名稱（例如：高二5班 探究與實作 第2次報告）', state.title || '探究與實作上台報告');
+  if (title === null) return;
+  if (teacher.sessionId) recordActivity(true); // 目前活動先存好
+  const groups = parseGroups($('groupsInput').value);
+  const base = defaultState();
+  const gs = groups.length >= 2 ? groups : state.groups;
+  const [reportOrder, questionOrder] = makeDerangedOrders(gs);
+  state = { ...base, title: safeText(title) || base.title, groups: gs, reportOrder, questionOrder, durations: state.durations };
+  lastDoneKey = ''; exclusionKey = '';
+  saveLocalOnly();
+  renderTeacher();
+  await createSession();
+  renderActivities();
+}
+
+const idleTimer = () => ({ running: false, phase: 'setup', duration: 0, startedAt: null, endsAt: null });
+
+async function loadActivity(id) {
+  const entry = loadActivities()[id];
+  if (!entry) return;
+  if (id === teacher.sessionId) return;
+  if (!confirm(`叫出「${entry.title}」繼續使用？\n目前的活動已自動儲存，之後也可以再叫回來。`)) return;
+  if (teacher.busy) return alert('正在連線中，請稍候再試。');
+  if (teacher.sessionId) recordActivity(true);
+  const previous = teacher.sessionId;
+  teacher.busy = true;
+  setTeacherStatus('讀取已儲存的活動中…', 'warn');
+  let useSnapshot = false;
+  try {
+    const core = await initFirebase();
+    const metaSnap = await withTimeout(core.get(dbRef(core, `sessions/${id}/meta`)), NET_TIMEOUT_MS, '讀取活動逾時，請確認網路。');
+    if (metaSnap.exists() && metaSnap.val().ownerUid === core.uid) {
+      const [stSnap, scSnap] = await Promise.all([
+        withTimeout(core.get(dbRef(core, `sessions/${id}/state`)), NET_TIMEOUT_MS, '讀取活動逾時'),
+        withTimeout(core.get(dbRef(core, `sessions/${id}/scores`)), NET_TIMEOUT_MS, '讀取評分逾時'),
+      ]);
+      const remoteState = stSnap.val() || {};
+      const remoteScores = normalizeScoresTree(scSnap.val());
+      const snap = entry.snapshot || {};
+      const merged = { ...snap, ...remoteState, groups: toList(remoteState.groups).length ? toList(remoteState.groups) : snap.groups, reportOrder: toList(remoteState.reportOrder).length ? toList(remoteState.reportOrder) : snap.reportOrder, questionOrder: toList(remoteState.questionOrder).length ? toList(remoteState.questionOrder) : snap.questionOrder, exclusion: remoteState.exclusion || snap.exclusion, scores: hasAnyScores(remoteScores) ? remoteScores : snap.scores };
+      delete merged.movedTo; delete merged.groupSet; delete merged.currentRoundKey;
+      state = normalizeLoadedState(merged);
+      state.timer = idleTimer();
+      if (state.phase !== 'done') state.phase = 'setup';
+      lastDoneKey = ''; exclusionKey = '';
+      saveLocalOnly();
+      localStorage.setItem(SESSION_KEY, id);
+      await attachSession(core, id, { uploadLocalScores: !hasAnyScores(remoteScores) && hasAnyScores(state.scores) });
+      if (previous && previous !== id) core.update(dbRef(core, `sessions/${previous}/state`), { movedTo: id }).catch((e) => console.warn('movedTo', e));
+      recordActivity(true);
+      renderTeacher();
+      alert(`已叫出「${state.title}」。\n學生掃原本這個活動的 QR（或還停在上一個活動頁面）都會自動接上。`);
+    } else {
+      useSnapshot = true;
+    }
+  } catch (e) {
+    console.error(e);
+    if (entry.snapshot && confirm(`雲端讀取失敗：${fbErrorText(e)}\n要改用這台電腦上的備份叫出（會產生新的 QR Code）？`)) useSnapshot = true;
+    else setTeacherStatus(`叫出活動失敗：${fbErrorText(e)}`, 'bad');
+  } finally {
+    teacher.busy = false;
+  }
+  if (useSnapshot) {
+    if (!entry.snapshot) return setTeacherStatus('找不到這個活動的資料', 'bad');
+    state = normalizeLoadedState(entry.snapshot);
+    state.timer = idleTimer();
+    if (state.phase !== 'done') state.phase = 'setup';
+    lastDoneKey = ''; exclusionKey = '';
+    saveLocalOnly();
+    renderTeacher();
+    await createSession(); // 會把評分一起上傳到新 Session
+    renderActivities();
+    alert(`已用本機備份叫出「${state.title}」，並建立新的 QR Code（原 Session 不屬於這個瀏覽器）。請學生重新掃描。`);
+  }
+}
+
+function saveLocalOnly() {
+  state.updatedAt = new Date().toISOString();
+  try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch (e) { console.warn(e); }
+}
+
+// ---------------------------------------------------------------- 排除已報告／已提問組別後重新抽籤
+
+// 已完成的輪次：在目前輪次之前的，或目前輪次已進入提問／評分、已有人評分、或活動已結束
+function doneRoundSet(s = state) {
+  const out = new Set();
+  const total = Math.min(s.reportOrder?.length || 0, s.questionOrder?.length || 0);
+  const cur = currentRound(s).index;
+  for (let i = 0; i < total; i++) {
+    if (i < cur) out.add(i);
+    else if (i === cur && (s.phase === 'question' || s.phase === 'rating' || s.phase === 'done' || Object.keys(s.scores?.[i] || {}).length > 0)) out.add(i);
+  }
+  return out;
+}
+
+function autoExclusion(s = state) {
+  const done = [...doneRoundSet(s)];
+  const bp = new Set(s.exclusion?.basePresented || []); const ba = new Set(s.exclusion?.baseAsked || []);
+  return {
+    presented: s.groups.filter((g) => bp.has(g) || done.some((i) => s.reportOrder[i] === g)),
+    asked: s.groups.filter((g) => ba.has(g) || done.some((i) => s.questionOrder[i] === g)),
+  };
+}
+
+function currentExclusion() {
+  if (!state.exclusion?.manual) return autoExclusion();
+  return { presented: state.exclusion.presented || [], asked: state.exclusion.asked || [] };
+}
+
+// 「1,3,5」「第1組、第3組」或直接打組名都可以；數字代表名單上第幾組
+function parseGroupRefs(text) {
+  const out = [];
+  for (const tok of String(text || '').split(/[\s,，、;；]+/).map((t) => t.trim()).filter(Boolean)) {
+    let g = null;
+    const exact = state.groups.find((x) => x === safeGroupName(tok));
+    if (exact) g = exact;
+    else {
+      const range = tok.match(/^(\d+)\s*[-~～]\s*(\d+)$/);
+      if (range) {
+        for (let n = Number(range[1]); n <= Number(range[2]); n++) if (state.groups[n - 1] && !out.includes(state.groups[n - 1])) out.push(state.groups[n - 1]);
+        continue;
+      }
+      const m = tok.match(/^第?\s*(\d+)\s*組?$/);
+      if (m && state.groups[Number(m[1]) - 1]) g = state.groups[Number(m[1]) - 1];
+    }
+    if (g && !out.includes(g)) out.push(g);
+  }
+  return out;
+}
+
+const groupNo = (g) => state.groups.indexOf(g) + 1;
+const refsText = (list) => list.map(groupNo).filter((n) => n > 0).sort((a, b) => a - b).join(',');
+
+function setExclusion(presented, asked, manual, { keepText = false } = {}) {
+  state.exclusion = { ...state.exclusion, presented: state.groups.filter((g) => presented.includes(g)), asked: state.groups.filter((g) => asked.includes(g)), manual };
+  saveState();
+  renderExclusion(keepText);
+}
+
+let exclusionKey = '';
+function renderExclusion(keepText = false) {
+  const grid = $('exclusionGrid');
+  if (!grid) return;
+  const ex = currentExclusion();
+  const key = JSON.stringify([state.groups, ex, Boolean(state.exclusion?.manual)]);
+  if (key === exclusionKey && !keepText) return;
+  exclusionKey = key;
+  const p = new Set(ex.presented); const a = new Set(ex.asked);
+  grid.innerHTML = '<div class="ex-row ex-head"><span>組別</span><span>已報告</span><span>已提問</span></div>' + state.groups.map((g, i) => `<div class="ex-row${p.has(g) ? ' is-presented' : ''}">
+      <span>${i + 1}．${escapeHtml(g)}</span>
+      <label class="ex-check"><input type="checkbox" data-kind="presented" data-group="${escapeHtml(g)}" ${p.has(g) ? 'checked' : ''} /></label>
+      <label class="ex-check"><input type="checkbox" data-kind="asked" data-group="${escapeHtml(g)}" ${a.has(g) ? 'checked' : ''} /></label>
+    </div>`).join('');
+  if (!keepText || document.activeElement !== $('presentedInput')) $('presentedInput').value = refsText(ex.presented);
+  if (!keepText || document.activeElement !== $('askedInput')) $('askedInput').value = refsText(ex.asked);
+  const remainReport = state.groups.filter((g) => !p.has(g));
+  const remainAsk = state.groups.filter((g) => !a.has(g));
+  $('exclusionMode').textContent = state.exclusion?.manual ? '手動調整中' : '依紀錄自動帶入';
+  $('exclusionMode').className = `pill ${state.exclusion?.manual ? 'warn' : 'ok'}`;
+  $('remainingInfo').innerHTML = `<div><strong>還沒報告（${remainReport.length} 組）：</strong>${escapeHtml(remainReport.join('、') || '—（全部都報告過了）')}</div>
+    <div><strong>還沒提問（${remainAsk.length} 組）：</strong>${escapeHtml(remainAsk.join('、') || '—（全部都提問過了）')}</div>`;
+}
+
+// 為剩下的報告組配提問組：優先用「還沒提問過」的組，不夠時再從已提問過的組補，且不可與報告組相同
+function assignQuestioners(reporters, fresh, all) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const pool = randomShuffle(fresh).concat(randomShuffle(all.filter((g) => !fresh.includes(g))));
+    const result = [];
+    let ok = true;
+    for (const r of reporters) {
+      const idx = pool.findIndex((g) => g !== r);
+      if (idx < 0) { ok = false; break; }
+      result.push(pool.splice(idx, 1)[0]);
+    }
+    // 若「還沒提問」的組數 ≥ 報告組數，就要求全部由還沒提問的組擔任
+    const freshNeeded = Math.min(fresh.length, reporters.length);
+    if (ok && result.filter((g) => fresh.includes(g)).length >= freshNeeded) return result;
+  }
+  // 理論上不會到這裡：退而求其次，只保證不與報告組相同
+  return reporters.map((r, i) => all.filter((g) => g !== r)[i % Math.max(1, all.length - 1)]);
+}
+
+async function redrawExcluding() {
+  const ex = currentExclusion();
+  const presented = new Set(ex.presented); const asked = new Set(ex.asked);
+  const reporters = randomShuffle(state.groups.filter((g) => !presented.has(g)));
+  if (!reporters.length) return alert('所有組別都已標記為「已報告」，沒有需要重新抽籤的組別。');
+  if (state.groups.length < 2) return alert('至少需要 2 個組別。');
+  const fresh = state.groups.filter((g) => !asked.has(g));
+  // 保留已完成、且報告組被標記為已報告的輪次（連同分數）
+  const done = doneRoundSet();
+  const total = Math.min(state.reportOrder.length, state.questionOrder.length);
+  const kept = [];
+  for (let i = 0; i < total; i++) if (done.has(i) && presented.has(state.reportOrder[i])) kept.push(i);
+  const keptText = kept.length ? `\n保留已完成的 ${kept.length} 輪（含分數）：${kept.map((i) => state.reportOrder[i]).join('、')}` : '';
+  const droppedScored = [];
+  for (let i = 0; i < total; i++) if (!kept.includes(i) && Object.keys(state.scores?.[i] || {}).length) droppedScored.push(state.reportOrder[i]);
+  const dropText = droppedScored.length ? `\n⚠️ 這些輪次已有評分但不會保留：${droppedScored.join('、')}（建議先下載 Excel／JSON）` : '';
+  if (!confirm(`排除已報告組別後重新抽籤：\n要抽的報告組 ${reporters.length} 組：${reporters.join('、')}${keptText}${dropText}\n確定？`)) return;
+  const questioners = assignQuestioners(reporters, fresh, state.groups);
+  const newScores = {};
+  kept.forEach((oldIdx, newIdx) => { if (state.scores?.[oldIdx]) newScores[newIdx] = state.scores[oldIdx]; });
+  state.reportOrder = kept.map((i) => state.reportOrder[i]).concat(reporters);
+  state.questionOrder = kept.map((i) => state.questionOrder[i]).concat(questioners);
+  state.scores = newScores;
+  state.currentIndex = kept.length;
+  state.phase = 'setup';
+  state.timer = idleTimer();
+  // 之後的進度會在這組標記之上自動累加（例如下週報告完的組別會自動算進「已報告」）
+  state.exclusion = { presented: [], asked: [], manual: false, basePresented: [...presented], baseAsked: [...asked] };
+  exclusionKey = '';
+  saveLocal();
+  await pushPublicState();
+  if (teacher.sessionId) await uploadAllScores();
+  // 重抽後：已完成輪次之外都還沒報告，讓「已報告」維持老師的標記
+  renderTeacher();
+  const unusedFresh = fresh.filter((g) => !questioners.includes(g));
+  alert(`已重新抽籤！本次從第 ${kept.length + 1} 輪開始：${reporters[0]} 報告、${questioners[0]} 提問。` + (unusedFresh.length ? `\n（還沒提問的組比報告組多，這次沒排到提問：${unusedFresh.join('、')}）` : ''));
 }
 
 // ---------------------------------------------------------------- 學生端
